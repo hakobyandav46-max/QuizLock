@@ -1,0 +1,429 @@
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
+
+namespace QuizLock
+{
+    public partial class MainForm : Form
+    {
+        // ---- Setup screen controls ----
+        private readonly Panel _setupPanel = new();
+        private readonly TextBox _txtUrl1 = new();
+        private readonly TextBox _txtUrl2 = new();
+        private readonly TextBox _txtUrl3 = new();
+        private readonly TextBox _txtPassword = new();
+        private readonly CheckBox _chkStrictMode = new();
+        private readonly NumericUpDown _numTimeLimit = new();
+        private readonly Button _btnStart = new();
+        private readonly Label _lblStatus = new();
+        private static readonly Random Rng = new();
+
+        // ---- Lock screen controls ----
+        private readonly Panel _lockPanel = new();
+        private WebView2? _webView;
+
+        private KeyboardHook? _hook;
+        private System.Windows.Forms.Timer? _timeLimitTimer;
+
+        private string _unlockPassword = string.Empty;
+        private string _quizHost = string.Empty;
+        private bool _strictMode;
+        private bool _isLocked;
+
+        // Domains treated as "AI assistants" and always blocked while locked,
+        // regardless of strict mode.
+        private static readonly string[] AiBlocklist =
+        {
+            "chat.openai.com", "chatgpt.com", "openai.com",
+            "claude.ai", "anthropic.com",
+            "gemini.google.com", "bard.google.com",
+            "copilot.microsoft.com",
+            "perplexity.ai", "poe.com", "character.ai",
+            "you.com", "phind.com", "meta.ai", "grok.com", "x.ai",
+            "pi.ai"
+        };
+
+        // Common SSO/login hosts allowed through even in strict mode, since
+        // Microsoft Forms itself requires signing in through these.
+        private static readonly string[] SsoAllowlist =
+        {
+            "login.microsoftonline.com", "login.live.com",
+            "login.windows.net", "account.microsoft.com"
+        };
+
+        public MainForm()
+        {
+            Text = "QuizLock";
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(480, 500);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+
+            BuildSetupPanel();
+            BuildLockPanel();
+
+            Controls.Add(_setupPanel);
+            Controls.Add(_lockPanel);
+            _lockPanel.Visible = false;
+
+            FormClosing += MainForm_FormClosing;
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => FailSafeRestore();
+            AppDomain.CurrentDomain.UnhandledException += (_, _) => FailSafeRestore();
+        }
+
+        // ---------------------------------------------------------------
+        // Setup screen
+        // ---------------------------------------------------------------
+        private void BuildSetupPanel()
+        {
+            _setupPanel.Dock = DockStyle.Fill;
+            _setupPanel.Padding = new Padding(20);
+
+            var lblUrl1 = new Label { Text = "Microsoft Forms link 1:", AutoSize = true, Location = new Point(20, 20) };
+            _txtUrl1.Location = new Point(20, 45);
+            _txtUrl1.Width = 430;
+            _txtUrl1.PlaceholderText = "https://forms.office.com/r/xxxxxxxxxx";
+
+            var lblUrl2 = new Label { Text = "Microsoft Forms link 2 (optional):", AutoSize = true, Location = new Point(20, 80) };
+            _txtUrl2.Location = new Point(20, 105);
+            _txtUrl2.Width = 430;
+            _txtUrl2.PlaceholderText = "https://forms.office.com/r/xxxxxxxxxx";
+
+            var lblUrl3 = new Label { Text = "Microsoft Forms link 3 (optional):", AutoSize = true, Location = new Point(20, 140) };
+            _txtUrl3.Location = new Point(20, 165);
+            _txtUrl3.Width = 430;
+            _txtUrl3.PlaceholderText = "https://forms.office.com/r/xxxxxxxxxx";
+
+            var lblRandomNote = new Label
+            {
+                Text = "One of the filled-in links above is picked at random each time you click Start.",
+                AutoSize = false, Width = 430, Height = 20,
+                Location = new Point(20, 200),
+                ForeColor = Color.DimGray, Font = new Font(Font.FontFamily, 8f)
+            };
+
+            var lblPassword = new Label { Text = "Unlock password (used to end lockdown early):", AutoSize = true, Location = new Point(20, 225) };
+            _txtPassword.Location = new Point(20, 250);
+            _txtPassword.Width = 430;
+            _txtPassword.UseSystemPasswordChar = true;
+
+            _chkStrictMode.Text = "Strict mode: only allow the form's own site (recommended)";
+            _chkStrictMode.Location = new Point(20, 290);
+            _chkStrictMode.Width = 430;
+            _chkStrictMode.Height = 40;
+            _chkStrictMode.Checked = true;
+
+            var lblTime = new Label { Text = "Auto-unlock after (minutes, 0 = no limit):", AutoSize = true, Location = new Point(20, 340) };
+            _numTimeLimit.Location = new Point(20, 365);
+            _numTimeLimit.Minimum = 0;
+            _numTimeLimit.Maximum = 600;
+            _numTimeLimit.Value = 0;
+            _numTimeLimit.Width = 100;
+
+            _btnStart.Text = "Start Lockdown";
+            _btnStart.Location = new Point(20, 410);
+            _btnStart.Width = 200;
+            _btnStart.Height = 35;
+            _btnStart.Click += BtnStart_Click;
+
+            _lblStatus.AutoSize = true;
+            _lblStatus.ForeColor = Color.DimGray;
+            _lblStatus.Location = new Point(20, 455);
+            _lblStatus.MaximumSize = new Size(430, 0);
+            _lblStatus.Text = "Unlock hotkey once locked: Ctrl+Alt+Shift+U";
+
+            _setupPanel.Controls.AddRange(new Control[]
+            {
+                lblUrl1, _txtUrl1, lblUrl2, _txtUrl2, lblUrl3, _txtUrl3, lblRandomNote,
+                lblPassword, _txtPassword, _chkStrictMode,
+                lblTime, _numTimeLimit, _btnStart, _lblStatus
+            });
+        }
+
+        private void BtnStart_Click(object? sender, EventArgs e)
+        {
+            var candidateTexts = new[] { _txtUrl1.Text, _txtUrl2.Text, _txtUrl3.Text }
+                .Select(t => t.Trim())
+                .Where(t => !string.IsNullOrEmpty(t))
+                .ToList();
+
+            if (candidateTexts.Count == 0)
+            {
+                MessageBox.Show(this, "Please enter at least one Microsoft Forms link.", "QuizLock",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var validUris = new List<Uri>();
+            foreach (var text in candidateTexts)
+            {
+                if (Uri.TryCreate(text, UriKind.Absolute, out var parsed) &&
+                    (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps))
+                {
+                    validUris.Add(parsed);
+                }
+                else
+                {
+                    MessageBox.Show(this, $"This link isn't valid:\n{text}", "QuizLock",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(_txtPassword.Text))
+            {
+                MessageBox.Show(this, "Please set an unlock password. You need this to end the lockdown.",
+                    "QuizLock", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var uri = validUris[Rng.Next(validUris.Count)];
+
+            _unlockPassword = _txtPassword.Text;
+            _quizHost = uri.Host;
+            _strictMode = _chkStrictMode.Checked;
+
+            // Microsoft Forms hides its own header/branding chrome when
+            // "embed=true" is present - nicer for a fullscreen kiosk view.
+            uri = MaybeAddEmbedParam(uri);
+
+            _ = StartLockAsync(uri);
+        }
+
+        private static Uri MaybeAddEmbedParam(Uri uri)
+        {
+            var isFormsHost = uri.Host.Equals("forms.office.com", StringComparison.OrdinalIgnoreCase) ||
+                               uri.Host.Equals("forms.microsoft.com", StringComparison.OrdinalIgnoreCase) ||
+                               uri.Host.EndsWith(".forms.office.com", StringComparison.OrdinalIgnoreCase);
+            if (!isFormsHost) return uri;
+
+            var query = uri.Query;
+            if (query.Contains("embed=true", StringComparison.OrdinalIgnoreCase)) return uri;
+
+            var separator = string.IsNullOrEmpty(query) ? "?" : "&";
+            return new Uri(uri + separator + "embed=true");
+        }
+
+        // ---------------------------------------------------------------
+        // Lock screen / WebView2
+        // ---------------------------------------------------------------
+        private void BuildLockPanel()
+        {
+            _lockPanel.Dock = DockStyle.Fill;
+            _lockPanel.BackColor = Color.Black;
+        }
+
+        private async Task StartLockAsync(Uri quizUri)
+        {
+            try
+            {
+                _webView = new WebView2 { Dock = DockStyle.Fill };
+                _lockPanel.Controls.Add(_webView);
+
+                await _webView.EnsureCoreWebView2Async(null);
+
+                var settings = _webView.CoreWebView2.Settings;
+                settings.AreDefaultContextMenusEnabled = false; // no right-click menu
+                settings.AreDevToolsEnabled = false;             // no F12 devtools
+                settings.AreBrowserAcceleratorKeysEnabled = false; // no Ctrl+T/N/W, F12, etc. inside the browser
+                settings.IsZoomControlEnabled = false;
+                settings.IsStatusBarEnabled = false;
+
+                _webView.CoreWebView2.NavigationStarting += CoreWebView2_NavigationStarting;
+                _webView.CoreWebView2.NewWindowRequested += (_, args) =>
+                {
+                    // Open any "open in new tab/window" attempt in the same view instead,
+                    // so it still passes through our navigation filter.
+                    args.Handled = true;
+                    _webView!.CoreWebView2.Navigate(args.Uri);
+                };
+
+                _webView.CoreWebView2.Navigate(quizUri.ToString());
+            }
+            catch (Exception ex)
+            {
+                // Clean up the partially-created browser control so a retry
+                // (after e.g. installing the WebView2 Runtime) doesn't leak
+                // an orphaned control into _lockPanel.
+                if (_webView is not null)
+                {
+                    _lockPanel.Controls.Remove(_webView);
+                    _webView.Dispose();
+                    _webView = null;
+                }
+
+                MessageBox.Show(this,
+                    "Could not start the embedded browser. Make sure the WebView2 Runtime is installed.\n\n" + ex.Message,
+                    "QuizLock", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // Switch to fullscreen lockdown UI
+            FormBorderStyle = FormBorderStyle.None;
+            WindowState = FormWindowState.Maximized;
+            TopMost = true;
+            _setupPanel.Visible = false;
+            _lockPanel.Visible = true;
+
+            SetTaskbarVisible(false);
+
+            _hook = new KeyboardHook();
+            _hook.Install();
+
+            NativeMethods.RegisterHotKey(Handle, NativeMethods.UNLOCK_HOTKEY_ID,
+                NativeMethods.MOD_CONTROL | NativeMethods.MOD_ALT | NativeMethods.MOD_SHIFT,
+                (uint)Keys.U);
+
+            var minutes = (int)_numTimeLimit.Value;
+            if (minutes > 0)
+            {
+                _timeLimitTimer = new System.Windows.Forms.Timer { Interval = minutes * 60 * 1000 };
+                _timeLimitTimer.Tick += (_, _) => Unlock(auto: true);
+                _timeLimitTimer.Start();
+            }
+
+            _isLocked = true;
+        }
+
+        private void CoreWebView2_NavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
+        {
+            var host = SafeGetHost(e.Uri);
+            if (host is null) return;
+
+            // Always block known AI assistant sites.
+            if (AiBlocklist.Any(blocked => host.Equals(blocked, StringComparison.OrdinalIgnoreCase) ||
+                                            host.EndsWith("." + blocked, StringComparison.OrdinalIgnoreCase)))
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            // Strict mode: only the form's own domain (plus common Microsoft
+            // sign-in hosts) is allowed.
+            if (_strictMode)
+            {
+                bool isFormDomain = host.Equals(_quizHost, StringComparison.OrdinalIgnoreCase) ||
+                                    host.EndsWith("." + _quizHost, StringComparison.OrdinalIgnoreCase) ||
+                                    RootDomain(host).Equals(RootDomain(_quizHost), StringComparison.OrdinalIgnoreCase);
+                bool isSso = SsoAllowlist.Any(sso => host.Equals(sso, StringComparison.OrdinalIgnoreCase) ||
+                                                      host.EndsWith("." + sso, StringComparison.OrdinalIgnoreCase));
+                if (!isFormDomain && !isSso)
+                {
+                    e.Cancel = true;
+                }
+            }
+        }
+
+        private static string? SafeGetHost(string url)
+        {
+            return Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host : null;
+        }
+
+        // Registrable-domain-ish comparison: helps things like
+        // "www.office.com" vs "forms.office.com" both count as "office.com".
+        // Simple last-two-labels check - good enough for typical .com/.io/etc
+        // domains; not exhaustive for multi-part TLDs like .co.uk.
+        private static string RootDomain(string host)
+        {
+            var parts = host.Split('.');
+            return parts.Length <= 2 ? host : string.Join(".", parts[^2..]);
+        }
+
+        // ---------------------------------------------------------------
+        // Unlock flow
+        // ---------------------------------------------------------------
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == NativeMethods.WM_HOTKEY && m.WParam.ToInt32() == NativeMethods.UNLOCK_HOTKEY_ID)
+            {
+                PromptUnlock();
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        private void PromptUnlock()
+        {
+            using var dlg = new UnlockPromptForm();
+            dlg.TopMost = true;
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+                if (dlg.EnteredPassword == _unlockPassword)
+                {
+                    Unlock(auto: false);
+                }
+                else
+                {
+                    MessageBox.Show(this, "Incorrect password.", "QuizLock",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+        }
+
+        private void Unlock(bool auto)
+        {
+            if (!_isLocked) return;
+            _isLocked = false;
+
+            _timeLimitTimer?.Stop();
+            _timeLimitTimer?.Dispose();
+            _timeLimitTimer = null;
+
+            NativeMethods.UnregisterHotKey(Handle, NativeMethods.UNLOCK_HOTKEY_ID);
+
+            _hook?.Uninstall();
+            _hook?.Dispose();
+            _hook = null;
+
+            SetTaskbarVisible(true);
+
+            if (_webView is not null)
+            {
+                _lockPanel.Controls.Remove(_webView);
+                _webView.Dispose();
+                _webView = null;
+            }
+
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            WindowState = FormWindowState.Normal;
+            TopMost = false;
+            ClientSize = new Size(480, 500);
+            StartPosition = FormStartPosition.CenterScreen;
+
+            _lockPanel.Visible = false;
+            _setupPanel.Visible = true;
+
+            if (auto)
+            {
+                MessageBox.Show(this, "Time limit reached - lockdown ended automatically.", "QuizLock",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private void SetTaskbarVisible(bool visible)
+        {
+            var taskbarHandle = NativeMethods.FindWindow("Shell_TrayWnd", null);
+            if (taskbarHandle != IntPtr.Zero)
+            {
+                NativeMethods.ShowWindow(taskbarHandle, visible ? NativeMethods.SW_SHOW : NativeMethods.SW_HIDE);
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Safety nets: whatever happens, never leave the machine locked down.
+        // ---------------------------------------------------------------
+        private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+        {
+            FailSafeRestore();
+        }
+
+        private void FailSafeRestore()
+        {
+            try { _hook?.Uninstall(); } catch { /* best effort */ }
+            try { NativeMethods.UnregisterHotKey(Handle, NativeMethods.UNLOCK_HOTKEY_ID); } catch { /* best effort */ }
+            try { SetTaskbarVisible(true); } catch { /* best effort */ }
+        }
+    }
+}
